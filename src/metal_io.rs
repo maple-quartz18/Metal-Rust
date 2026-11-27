@@ -14,12 +14,43 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+/// Directory names reserved for the uncompressed legacy and zlib formats.
+/// Legacy `SXMTLIO2` cache directory.
+pub const LEGACY_CACHE_DIR: &str = "metal_io_models_v2";
+/// Metal-native zlib cache directory.
+pub const ZLIB_CACHE_DIR: &str = "metal_io_models_zlib";
 /// Number of bytes in the duplicated plaintext metadata header.
 pub const HEADER_LEN: usize = 48;
 /// Magic stored at the start of every compressed-cache header.
 pub const MAGIC: [u8; 8] = *b"SXMTLIOZ";
 /// Current compressed-cache header version.
 pub const VERSION: u32 = 1;
+
+/// Selects which model-cache directory a caller should use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheFormat {
+    /// Existing `SXMTLIO2` cache, owned by the caller.
+    Legacy,
+    /// Metal-native zlib cache written by this module.
+    Zlib,
+}
+
+impl CacheFormat {
+    /// Returns the stable directory name for this format.
+    #[must_use]
+    pub const fn directory_name(self) -> &'static str {
+        match self {
+            Self::Legacy => LEGACY_CACHE_DIR,
+            Self::Zlib => ZLIB_CACHE_DIR,
+        }
+    }
+}
+
+/// Returns the directory for a selected cache format below `cache_root`.
+#[must_use]
+pub fn cache_directory(cache_root: &Path, format: CacheFormat) -> PathBuf {
+    cache_root.join(format.directory_name())
+}
 
 /// Input data for one compressed model cache entry.
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +87,16 @@ pub struct CachePaths {
     pub metadata: PathBuf,
 }
 
+/// Builds zlib cache paths below a format-specific cache directory.
+#[must_use]
+pub fn cache_paths(cache_root: &Path, key: &str) -> CachePaths {
+    let directory = cache_directory(cache_root, CacheFormat::Zlib);
+    CachePaths {
+        payload: directory.join(format!("{key}.gpuio")),
+        metadata: directory.join(format!("{key}.meta")),
+    }
+}
+
 /// Successful result of sidecar validation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValidatedCache {
@@ -76,8 +117,10 @@ pub fn write(
         return Ok(false);
     }
     if payload_exists || metadata_exists {
-        let _ = fs::remove_file(&paths.payload);
-        let _ = fs::remove_file(&paths.metadata);
+        return Err(
+            "Metal IO cache has an incomplete payload/metadata pair; remove both files before rewriting"
+                .into(),
+        );
     }
     if let Some(parent) = paths.payload.parent() {
         fs::create_dir_all(parent)?;
@@ -87,11 +130,18 @@ pub fn write(
     }
 
     let header = encode_header(payload)?;
-    let pid = std::process::id();
-    let payload_tmp = paths.payload.with_extension(format!("gpuio.{pid}.tmp"));
-    let metadata_tmp = paths.metadata.with_extension(format!("meta.{pid}.tmp"));
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    let payload_tmp = temporary_path(&paths.payload, &nonce);
+    let metadata_tmp = temporary_path(&paths.metadata, &nonce);
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        cleanup_temporary_files(paths)?;
         write_new_file(&metadata_tmp, &header)?;
         let chunk_size = IoCompressionContext::default_chunk_size()?;
         let mut context = IoCompressionContext::new(
@@ -103,8 +153,10 @@ pub fn write(
         context.append(payload.vertex)?;
         context.append(payload.index)?;
         context.finish()?;
+        sync_parent(paths.payload.parent())?;
         fs::rename(&payload_tmp, &paths.payload)?;
         fs::rename(&metadata_tmp, &paths.metadata)?;
+        sync_parent(paths.metadata.parent())?;
         Ok(())
     })();
 
@@ -113,6 +165,42 @@ pub fn write(
         let _ = fs::remove_file(&metadata_tmp);
     }
     result.map(|()| true)
+}
+
+fn temporary_path(path: &Path, nonce: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cache");
+    path.with_file_name(format!(".{name}.{nonce}.tmp"))
+}
+
+fn cleanup_temporary_files(paths: &CachePaths) -> Result<(), Box<dyn std::error::Error>> {
+    for path in [&paths.payload, &paths.metadata] {
+        let Some(directory) = path.parent() else {
+            continue;
+        };
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let prefix = format!(".{file_name}.");
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".tmp") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sync_parent(parent: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = parent {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Validates the sidecar, identity, lengths, and payload presence.
@@ -266,5 +354,41 @@ mod tests {
         write_new_file(&path, &header).unwrap();
         assert!(read_metadata(&path).is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn format_directories_are_disjoint() {
+        let root = Path::new("/cache");
+        assert_eq!(
+            cache_directory(root, CacheFormat::Legacy),
+            root.join("metal_io_models_v2")
+        );
+        assert_eq!(
+            cache_directory(root, CacheFormat::Zlib),
+            root.join("metal_io_models_zlib")
+        );
+        assert_ne!(
+            cache_paths(root, "abc").payload,
+            root.join("metal_io_models_v2/abc.buf")
+        );
+    }
+
+    #[test]
+    fn stale_temporary_files_are_removed() {
+        let root =
+            std::env::temp_dir().join(format!("metal-io-cleanup-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let paths = CachePaths {
+            payload: root.join("model.gpuio"),
+            metadata: root.join("model.meta"),
+        };
+        let stale_payload = root.join(".model.gpuio.old.tmp");
+        let stale_metadata = root.join(".model.meta.old.tmp");
+        File::create(&stale_payload).unwrap();
+        File::create(&stale_metadata).unwrap();
+        cleanup_temporary_files(&paths).unwrap();
+        assert!(!stale_payload.exists());
+        assert!(!stale_metadata.exists());
+        let _ = fs::remove_dir_all(root);
     }
 }
