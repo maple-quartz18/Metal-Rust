@@ -83,6 +83,7 @@ pub mod metal4_fx;
 pub mod metal_fx;
 #[path = "QuartzCore/QuartzCore.rs"]
 pub mod quartz_core;
+pub mod metal_io;
 
 pub use foundation::{Error, ErrorKind};
 pub use metal::{
