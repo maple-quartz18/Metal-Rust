@@ -254,6 +254,37 @@ pub fn read(
     Ok((vertex_buffer, index_buffer))
 }
 
+/// Loads vertex and index payloads directly into caller-owned PRIVATE buffers.
+pub fn read_into(
+    device: &Device,
+    io_queue: &IoCommandQueue,
+    paths: &CachePaths,
+    identity: &str,
+    vertex_buffer: &Buffer,
+    index_buffer: &Buffer,
+    vertex_len: usize,
+    index_len: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate(paths, identity, vertex_len, index_len)?;
+    let handle = device.new_io_file_handle(
+        &paths.payload,
+        Some(IOCompressionMethod::IOCompressionMethodZlib),
+    )?;
+    let mut commands = io_queue.command_buffer()?;
+    commands.load_buffer(vertex_buffer, 0, vertex_len, &handle, HEADER_LEN)?;
+    commands.load_buffer(
+        index_buffer,
+        0,
+        index_len,
+        &handle,
+        HEADER_LEN
+            .checked_add(vertex_len)
+            .ok_or("Metal IO cache source offset overflow")?,
+    )?;
+    commands.commit().wait()?;
+    Ok(())
+}
+
 /// Creates a default Metal IO command queue.
 pub fn new_io_queue(device: &Device) -> Result<IoCommandQueue, Error> {
     let descriptor = IOCommandQueueDescriptor::new()?;
